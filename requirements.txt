@@ -1,5 +1,5 @@
 discord.py
 PyNaCl
-youtube-dl
+yt_dlp
 python-dotenv
 asyncio
