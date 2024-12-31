@@ -29,6 +29,8 @@ guild_queues = {}
 guild_current_voice = {}    
 guild_pages = {}
 
+guild_lock = asyncio.Lock()
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
@@ -39,8 +41,28 @@ async def on_ready():
 async def on_shutdown():
     logging.info("Bot is shutting down. Clearing queues...")
     # Clear all queues
+    for guild_id in guild_queues:
+        if guild_id in guild_current_voice and guild_current_voice[guild_id]:
+            await guild_current_voice[guild_id].disconnect()
+            logging.info(f"Disconnected from voice channel in guild {guild_id}")
     guild_queues.clear()
     logging.info("All queues have been cleared.")
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    # Only handle updates for the bot itself
+    if member == bot.user:
+        # Check if the bot was in a voice channel and is now disconnected
+        if before.channel and not after.channel:
+            guild_id = member.guild.id
+            logging.info(f"Bot disconnected from voice channel in guild {member.guild.name}. Attempting to reconnect...")
+            
+            # Try to reconnect to the same channel
+            if guild_id in guild_current_voice and guild_current_voice[guild_id]:
+                channel = guild_current_voice[guild_id]
+                await channel.connect()
+                logging.info(f"Reconnected to {channel} in guild {member.guild.name}")
+
 
 @bot.tree.command(name="join", description="Make the bot join your voice channel")
 async def join(interaction: discord.Interaction):
@@ -72,7 +94,6 @@ async def leave(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("I'm not in a voice channel.", ephemeral=True)
 
-
 @bot.tree.command(name="add", description="Add a YouTube video or playlist to the queue.")
 async def add_to_queue(interaction: discord.Interaction, url: str):
     await interaction.response.defer(ephemeral=True)  # Acknowledge the interaction quickly
@@ -82,6 +103,8 @@ async def add_to_queue(interaction: discord.Interaction, url: str):
     # Check if the guild has a queue, otherwise create an empty one
     if guild_id not in guild_queues:
         guild_queues[guild_id] = []
+    
+    private_or_deleted = 0
     
     # Check if the URL is a playlist or a single video
     if "playlist" in url:
@@ -93,8 +116,21 @@ async def add_to_queue(interaction: discord.Interaction, url: str):
                 if 'entries' in playlist_info:
                     for entry in playlist_info['entries']:
                         video_url = entry['url']
+                        video_title = entry.get('title', None)
+                        
+                        # Check if the video is deleted (no title) or unavailable
+                        if not video_title or video_title == "[Private video]" or video_title == "[Deleted video]":
+                            private_or_deleted += 1
+                            logging.warning(f"Skipping deleted video: {video_url}")
+                            continue
+                        
+                        # Check if the video is unlisted (status check)
+                        if 'unlisted' in entry.get('status', ''):
+                            logging.info(f"Adding unlisted video: {video_url} to queue.")
+                        
                         guild_queues[guild_id].append(video_url)
-                    await interaction.followup.send(f"Added {len(playlist_info['entries'])} videos from the playlist to the queue.")
+                        logging.info(f"Added {video_title} to queue in guild {interaction.guild.name}")
+                    await interaction.followup.send(f"Added {len(playlist_info['entries']) - private_or_deleted} videos from the playlist to the queue.")
                 else:
                     await interaction.followup.send("Failed to extract videos from the playlist.", ephemeral=True)
             except youtube_dl.utils.DownloadError as e:
@@ -105,10 +141,22 @@ async def add_to_queue(interaction: discord.Interaction, url: str):
         try:
             with youtube_dl.YoutubeDL({'quiet': True}) as ydl:
                 video_info = ydl.extract_info(url, download=False)
+                
                 if 'entries' not in video_info:  # Check if the video info contains entries (playlist)
-                    video_title = video_info.get('title', 'Unknown Title')
+                    video_title = video_info.get('title', None)
+                    
+                    # Check if the video is deleted (no title) or unavailable
+                    if not video_title:
+                        logging.warning(f"Skipping deleted video: {url}")
+                        await interaction.followup.send("The video is unavailable or deleted.", ephemeral=True)
+                        return
+                    
+                    # Check if the video is unlisted (status check)
+                    if 'unlisted' in video_info.get('status', ''):
+                        logging.info(f"Adding unlisted video: {url} to queue.")
+                    
                     guild_queues[guild_id].append(url)
-                    logging.info(f"Added video {video_title} to queue in guild {interaction.guild.name}")
+                    logging.info(f"Added {video_title} to queue in guild {interaction.guild.name}")
                     await interaction.followup.send(f"Added to queue: {video_title}")
                 else:
                     await interaction.followup.send(f"Error: Video is part of a playlist. Please provide a valid single video URL.", ephemeral=True)
@@ -117,70 +165,52 @@ async def add_to_queue(interaction: discord.Interaction, url: str):
             logging.error(f"Error adding video: {str(e)}")
 
 
-@bot.tree.command(name="queue", description="View the current music queue.")
-async def queue(interaction: discord.Interaction):
-    guild_id = interaction.guild.id
-
-    # Check if the guild has a queue
-    if guild_id not in guild_queues or not guild_queues[guild_id]:
-        await interaction.response.send_message("The queue is empty.", ephemeral=True)
-        return
-
-    # Create an embed to display the queue in a card-like format
-    embed = discord.Embed(title="Current Queue", description="Here are the videos in the queue:", color=discord.Color.blue())
-
-    for i, song in enumerate(guild_queues[guild_id][:20], 1):  # Show the first 20 songs
-        embed.add_field(name=f"Song {i}", value=song['title'], inline=False)
-
-    # Add a footer with the total number of songs
-    embed.set_footer(text=f"Total songs: {len(guild_queues[guild_id])}")
-
-    # Send the message as an ephemeral message (visible only to the user)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
 
 @bot.tree.command(name="play", description="Play tracks from the queue.")
 async def play(interaction: discord.Interaction):
     guild_id = interaction.guild.id
-    if guild_id not in guild_current_voice or guild_current_voice[guild_id] is None:
-        await interaction.response.send_message("I'm not in a voice channel. Use /join first.")
-        return
 
-    if guild_id not in guild_queues or not guild_queues[guild_id]:
-        await interaction.response.send_message("Queue is empty!")
-        return
+    # Acquire lock to safely modify the guild's voice state and queue
+    async with guild_lock:
+        if guild_id not in guild_current_voice or guild_current_voice[guild_id] is None:
+            await interaction.response.send_message("I'm not in a voice channel. Use /join first.")
+            return
 
-    await interaction.response.send_message("Starting playback...")  # Send the response once at the beginning
+        if guild_id not in guild_queues or not guild_queues[guild_id]:
+            await interaction.response.send_message("Queue is empty!")
+            return
 
-    while guild_queues[guild_id]:
-        url = guild_queues[guild_id].pop(0)  # Get the next video from the queue
-        channel = interaction.channel
-        await channel.send(f"Now playing: {url}")
+        await interaction.response.send_message("Starting playback...")  # Send the response once at the beginning
 
-        try:
-            with youtube_dl.YoutubeDL({'format': 'bestaudio', 'noplaylist': True, 'quiet': True}) as ydl:
-                info = ydl.extract_info(url, download=False)
-                audio_url = info['url']
+        while guild_queues[guild_id]:
+            url = guild_queues[guild_id].pop(0)  # Get the next video from the queue
+            channel = interaction.channel
+            await channel.send(f"Now playing: {url}")
 
-            def after_playing(error):
-                if error:
-                    print(f"Error: {error}")
+            try:
+                with youtube_dl.YoutubeDL({'format': 'bestaudio', 'noplaylist': True, 'quiet': True}) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    audio_url = info['url']
 
-            guild_current_voice[guild_id].play(discord.FFmpegPCMAudio(audio_url), after=after_playing)
-            guild_current_voice[guild_id].source = discord.PCMVolumeTransformer(guild_current_voice[guild_id].source, volume=0.5)
-            logging.info(f"Now playing {url} in guild {interaction.guild.name}")
+                def after_playing(error):
+                    if error:
+                        print(f"Error: {error}")
 
-            while guild_current_voice[guild_id].is_playing():
-                await asyncio.sleep(1)
+                guild_current_voice[guild_id].play(discord.FFmpegPCMAudio(audio_url), after=after_playing)
+                guild_current_voice[guild_id].source = discord.PCMVolumeTransformer(guild_current_voice[guild_id].source, volume=0.5)
+                logging.info(f"Now playing {url} in guild {interaction.guild.name}")
 
-        except youtube_dl.DownloadError as e:
-            logging.error(f"Failed to fetch the video: {str(e)} in guild {interaction.guild.name}")
-            await channel.send(f"Failed to fetch the video: {str(e)}")
-            continue  # Skip to the next video in the queue
+                while guild_current_voice[guild_id].is_playing():
+                    await asyncio.sleep(1)
 
-    await channel.send("Queue is empty!")
+            except youtube_dl.DownloadError as e:
+                logging.error(f"Failed to fetch the video: {str(e)} in guild {interaction.guild.name}")
+                await channel.send(f"Failed to fetch the video: {str(e)}")
+                continue  # Skip to the next video in the queue
 
-# Pause Command
+        await channel.send("Queue is empty!")
+
+# Pause Command TODO
 @bot.tree.command(name="pause", description="Pause the current track.")
 async def pause(interaction: discord.Interaction):
     guild_id = interaction.guild.id
@@ -191,7 +221,7 @@ async def pause(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("No audio is playing to pause.", ephemeral=True)
 
-# Resume Command
+# Resume Command TODO
 @bot.tree.command(name="resume", description="Resume the paused track.")
 async def resume(interaction: discord.Interaction):
     guild_id = interaction.guild.id
@@ -202,6 +232,7 @@ async def resume(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("No audio is paused to resume.", ephemeral=True)
 
+# VERIFY TODO
 @bot.tree.command(name="clear_queue", description="Clear the music queue.")
 async def clear_queue(interaction: discord.Interaction):
     guild_id = interaction.guild.id
@@ -224,6 +255,9 @@ async def skip(interaction: discord.Interaction):
         await interaction.response.send_message("Skipped the current track.")
     else:
         await interaction.response.send_message("No track is playing to skip.", ephemeral=True)
+
+
+# LOOK INTO
         
 @bot.tree.command(name="skip_to", description="Skip to a specific track in the queue.")
 async def skip_to_number(interaction: discord.Interaction, number: int):
@@ -269,6 +303,8 @@ async def skip_to_number(interaction: discord.Interaction, number: int):
         logging.error(f"Failed to fetch the video: {str(e)} in guild {interaction.guild.name}")
         await interaction.response.send_message(f"Failed to fetch the video: {str(e)}", ephemeral=True)
 
+
+# TODO
 @bot.tree.command(name="shuffle", description="Shuffle the current music queue.")
 async def shuffle(interaction: discord.Interaction):
     guild_id = interaction.guild.id
@@ -296,7 +332,6 @@ async def shuffle(interaction: discord.Interaction):
 
     # Send the embed with the shuffled queue
     await interaction.response.send_message(embed=embed)
-
 
 load_dotenv()
 
